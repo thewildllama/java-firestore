@@ -33,15 +33,23 @@ import com.google.cloud.firestore.v1.FirestoreSettings;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nonnull;
@@ -236,12 +244,19 @@ public final class BulkWriter implements AutoCloseable {
   @GuardedBy("lock")
   private boolean writesEnqueued = false;
 
+  private boolean shutDownExecutor = false;
+
   BulkWriter(FirestoreImpl firestore, BulkWriterOptions options) {
     this.firestore = firestore;
-    this.bulkWriterExecutor =
-        options.getExecutor() != null
-            ? options.getExecutor()
-            : Executors.newSingleThreadScheduledExecutor();
+
+    if (options.getExecutor() != null) {
+      this.bulkWriterExecutor = options.getExecutor();
+    } else {
+      this.shutDownExecutor = true;
+      this.bulkWriterExecutor = Executors.newSingleThreadScheduledExecutor(
+              new ThreadFactoryBuilder().setNameFormat("bulk-writer-%d").build()
+      );
+    }
     this.successExecutor = MoreExecutors.directExecutor();
     this.errorExecutor = MoreExecutors.directExecutor();
     this.bulkCommitBatch = new BulkCommitBatch(firestore, bulkWriterExecutor, maxBatchSize);
@@ -588,6 +603,9 @@ public final class BulkWriter implements AutoCloseable {
             batch.update(documentReference, precondition, fieldPath, value, moreFieldsAndValues));
   }
 
+  final Set<BulkWriterOperation> PENDING_OPERATIONS = new ConcurrentSkipListSet<>();
+  final Set<BulkWriterOperation> FAILED_OPERATIONS = new ConcurrentSkipListSet<>();
+
   /**
    * Schedules the provided write operation and runs the user success callback when the write result
    * is obtained.
@@ -615,7 +633,9 @@ public final class BulkWriter implements AutoCloseable {
               synchronized (lock) {
                 return invokeUserErrorCallbackLocked(e);
               }
-            });
+            },
+            PENDING_OPERATIONS,
+            FAILED_OPERATIONS);
 
     synchronized (lock) {
       verifyNotClosedLocked();
@@ -706,7 +726,12 @@ public final class BulkWriter implements AutoCloseable {
     }
     return lastOperation;
   }
+  private static final AtomicLong IDENTIFIER_COUNTER = new AtomicLong(0);
+  private final long identifier = IDENTIFIER_COUNTER.incrementAndGet();
 
+  public long getIdentifier() {
+    return identifier;
+  }
   /**
    * Commits all enqueued writes and marks the BulkWriter instance as closed.
    *
@@ -722,7 +747,68 @@ public final class BulkWriter implements AutoCloseable {
       flushFuture = flushLocked();
       closed = true;
     }
-    flushFuture.get();
+
+    ThreadFactory threadFactory =  new ThreadFactoryBuilder()
+            .setDaemon(true).setNameFormat("java-firestore-watch-dog-d").build();
+
+    ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(threadFactory);
+
+
+    AtomicLong lastSeenSize = new AtomicLong(PENDING_OPERATIONS.size());
+    AtomicLong lastSizeChangeTimestamp = new AtomicLong(System.currentTimeMillis());
+    AtomicBoolean intentionallyCanceled = new AtomicBoolean(false);
+
+    final ScheduledFuture<?> scheduledFuture = executor.scheduleAtFixedRate(() -> {
+      System.out.printf("Watchdog(%d): Current batch has %d operations.\n", identifier, bulkCommitBatch.pendingOperations.size());
+      System.out.printf("Watchdog(%d): Still waiting on %d operations.\n", identifier, PENDING_OPERATIONS.size());
+      System.out.printf("Watchdog(%d): Sees %d failed operations.\n", identifier, FAILED_OPERATIONS.size());
+
+      if (PENDING_OPERATIONS.isEmpty()) {
+        System.out.printf("Watchdog(%d): isEmpty() is true. Forcefully terminating in 5 seconds.\n", identifier);
+        try {
+            Thread.sleep(5_000);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+        System.out.printf("Watchdog(%d): Forcefully terminating if not already terminated.\n", identifier);
+        intentionallyCanceled.set(true);
+        flushFuture.cancel(true);
+      }
+
+      if (lastSeenSize.get() != PENDING_OPERATIONS.size()) {
+        lastSeenSize.set(PENDING_OPERATIONS.size());
+        lastSizeChangeTimestamp.set(System.currentTimeMillis());
+      } else {
+        if (System.currentTimeMillis() - lastSizeChangeTimestamp.get() > 10_000) {
+          System.out.printf("Watchdog(%d): Current batch has %d operations. Retrying seemingly stuck operations.\n", identifier, bulkCommitBatch.pendingOperations.size());
+
+          for (BulkWriterOperation bulkWriterOperation : PENDING_OPERATIONS) {
+            bulkWriterOperation.forceRetry();
+          }
+          System.out.printf("Watchdog(%d): Calling flush with %d operations in current batch.\n", identifier, bulkCommitBatch.pendingOperations.size());
+
+          try {
+            flush();
+          } catch (Throwable t) {
+            System.out.println();
+          }
+        }
+      }
+    }, 5 , 5, TimeUnit.SECONDS);
+
+    try {
+      flushFuture.get();
+    } catch (CancellationException e) {
+      if (intentionallyCanceled.get()) {
+        System.out.printf("%d: Flush was intentionally canceled. Swallowing CancellationException.\n", identifier);
+      } else {
+        System.out.printf("%d: Flush was not intentionally canceled. Re-throwing CancellationException.\n", identifier);
+        throw e;
+      }
+    }
+
+    executor.shutdownNow();
+    bulkWriterExecutor.shutdown();
   }
 
   /**

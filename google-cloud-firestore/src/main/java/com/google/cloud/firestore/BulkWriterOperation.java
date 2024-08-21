@@ -24,16 +24,27 @@ import com.google.api.core.SettableApiFuture;
 import com.google.common.util.concurrent.MoreExecutors;
 import io.grpc.Status;
 
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * Represents a single write for BulkWriter, encapsulating operation dispatch and error handling.
  */
-class BulkWriterOperation {
+class BulkWriterOperation implements Comparable<BulkWriterOperation> {
   private final SettableApiFuture<WriteResult> operationFuture = SettableApiFuture.create();
   private final DocumentReference documentReference;
   private final BulkWriter.OperationType operationType;
   private final ApiFunction<BulkWriterOperation, Void> scheduleWriteCallback;
   private final ApiFunction<WriteResult, ApiFuture<Void>> successListener;
   private final ApiFunction<BulkWriterException, ApiFuture<Boolean>> errorListener;
+
+  private static final AtomicLong IDENTIFIER_COUNTER = new AtomicLong(0);
+  private final long identifier = IDENTIFIER_COUNTER.incrementAndGet();
+
+  public long getIdentifier() {
+    return identifier;
+  }
 
   /**
    * The default initial backoff time in milliseconds after an error. Set to 1s according to
@@ -47,29 +58,37 @@ class BulkWriterOperation {
   /** The default factor to increase the backup by after each failed attempt. */
   public static final double DEFAULT_BACKOFF_FACTOR = 1.5;
 
+  private final Set<BulkWriterOperation> pendingOperations;
+  private final Set<BulkWriterOperation> failedOperations;
+
   private int failedAttempts = 0;
   private Status lastStatus;
 
   private int backoffDuration = 0;
 
   /**
-   * @param documentReference The document reference being written to.
-   * @param operationType The type of operation that created this write.
+   * @param documentReference     The document reference being written to.
+   * @param operationType         The type of operation that created this write.
    * @param scheduleWriteCallback The callback used to schedule a new write.
-   * @param successListener The user-provided success handler.
-   * @param errorListener The user-provided error handler.
+   * @param successListener       The user-provided success handler.
+   * @param errorListener         The user-provided error handler.
    */
   BulkWriterOperation(
-      DocumentReference documentReference,
-      BulkWriter.OperationType operationType,
-      ApiFunction<BulkWriterOperation, Void> scheduleWriteCallback,
-      ApiFunction<WriteResult, ApiFuture<Void>> successListener,
-      ApiFunction<BulkWriterException, ApiFuture<Boolean>> errorListener) {
+          DocumentReference documentReference,
+          BulkWriter.OperationType operationType,
+          ApiFunction<BulkWriterOperation, Void> scheduleWriteCallback,
+          ApiFunction<WriteResult, ApiFuture<Void>> successListener,
+          ApiFunction<BulkWriterException, ApiFuture<Boolean>> errorListener,
+          Set<BulkWriterOperation> pendingOperations,
+          Set<BulkWriterOperation> failedOperations) {
     this.documentReference = documentReference;
     this.operationType = operationType;
     this.scheduleWriteCallback = scheduleWriteCallback;
     this.successListener = successListener;
     this.errorListener = errorListener;
+    this.pendingOperations = pendingOperations;
+    this.failedOperations = pendingOperations;
+    pendingOperations.add(this);
   }
 
   /**
@@ -107,6 +126,8 @@ class BulkWriterOperation {
         new ApiFutureCallback<Boolean>() {
           @Override
           public void onFailure(Throwable throwable) {
+            pendingOperations.remove(BulkWriterOperation.this);
+            failedOperations.add(BulkWriterOperation.this);
             operationFuture.setException(throwable);
             callbackFuture.set(null);
           }
@@ -118,6 +139,8 @@ class BulkWriterOperation {
               updateBackoffDuration();
               scheduleWriteCallback.apply(BulkWriterOperation.this);
             } else {
+              pendingOperations.remove(BulkWriterOperation.this);
+              failedOperations.add(BulkWriterOperation.this);
               operationFuture.setException(bulkWriterException);
             }
             callbackFuture.set(null);
@@ -140,6 +163,7 @@ class BulkWriterOperation {
 
   /** Callback invoked when the operation succeeds. */
   public ApiFuture<Void> onSuccess(final WriteResult result) {
+    pendingOperations.remove(this);
     final SettableApiFuture<Void> callbackFuture = SettableApiFuture.create();
     ApiFutures.addCallback(
         this.successListener.apply(result),
@@ -158,5 +182,31 @@ class BulkWriterOperation {
         },
         MoreExecutors.directExecutor());
     return callbackFuture;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    BulkWriterOperation that = (BulkWriterOperation) o;
+    return identifier == that.identifier;
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hashCode(identifier);
+  }
+
+  @Override
+  public int compareTo(BulkWriterOperation o) {
+    return Long.compare(this.identifier, o.identifier);
+  }
+
+  public void forceRetry() {
+    scheduleWriteCallback.apply(this);
   }
 }
